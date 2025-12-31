@@ -8,6 +8,7 @@ import json
 import time
 import logging
 import base64
+import shutil
 import os
 from typing import Dict, List, Optional, Any, Union
 from pathlib import Path
@@ -153,27 +154,32 @@ class TouTiaoPublisher:
         """设置Chrome浏览器驱动"""
         chrome_options = webdriver.ChromeOptions()
         
+        chrome_options.binary_location = "/usr/bin/google-chrome"
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--remote-debugging-port=9222")
+        chrome_options.add_argument("--user-data-dir=/tmp/chrome-profile")
         # 添加浏览器选项
         for option in SELENIUM_CONFIG['chrome_options']:
             chrome_options.add_argument(option)
-        
+        chrome_options.add_argument("--no-sandbox")
         # 设置用户代理
         chrome_options.add_argument(f"--user-agent={self.session.headers['User-Agent']}")
         
         # 如果配置为无头模式
         if SELENIUM_CONFIG.get('headless', False):
-            chrome_options.add_argument('--headless')
+            chrome_options.add_argument('--headless=new')
         
         # 直接使用本地ChromeDriver路径
-        driver_path = r"C:\code\chromedrivers\chromedriver-win64\chromedriver.exe"
+        driver_path = shutil.which("chromedriver")
         
-        if not os.path.exists(driver_path):
-            raise Exception(f"ChromeDriver文件不存在: {driver_path}")
+        if not driver_path:
+            raise Exception("ChromeDriver 未安装或不在 PATH 中")
         
-        logger.info(f"使用ChromeDriver: {driver_path}")
+        logger.info(f"使用 ChromeDriver: {driver_path}")
         
         # 创建服务和驱动
-        service = Service(executable_path=driver_path)
+        service = Service("/usr/local/bin/chromedriver")
         driver = webdriver.Chrome(service=service, options=chrome_options)
         
         # 设置超时时间
