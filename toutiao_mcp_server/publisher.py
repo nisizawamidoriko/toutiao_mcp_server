@@ -13,12 +13,6 @@ import os
 from typing import Dict, List, Optional, Any, Union
 from pathlib import Path
 import mimetypes
-import boto3
-from botocore.client import Config as BotoConfig  # 别名避开 config.py 冲突
-import uuid
-import shutil
-import tempfile
-from urllib.parse import urlparse
 
 import requests
 from PIL import Image
@@ -29,7 +23,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
-from .config import TOUTIAO_URLS, CONTENT_CONFIG, SELENIUM_CONFIG, S3_CONFIG
+from .config import TOUTIAO_URLS, CONTENT_CONFIG, SELENIUM_CONFIG
 from .auth import TouTiaoAuth
 
 logger = logging.getLogger(__name__)
@@ -46,36 +40,6 @@ class TouTiaoPublisher:
         """
         self.auth = auth
         self.session = auth.session
-        self.s3_client = boto3.client(
-            's3',
-            aws_access_key_id=S3_CONFIG['access_key'],
-            aws_secret_access_key=S3_CONFIG['secret_key'],
-            endpoint_url=S3_CONFIG['endpoint'],
-            config=BotoConfig(signature_version='s3v4') # 使用别名
-        )
-    # 新增：内部下载方法
-    def _prepare_local_images(self, image_keys: List[str]) -> List[str]:
-        local_paths = []
-        # 创建本次任务的唯一临时目录
-        temp_dir = Path(tempfile.gettempdir()) / f"tt_publish_{uuid.uuid4().hex}"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-
-        for key in image_keys:
-            try:
-                # 即使传的是带http的URL，也尝试提取出 Key
-                object_key = urlparse(key).path.lstrip('/')
-                if object_key.startswith(S3_CONFIG['bucket_name']):
-                    object_key = object_key[len(S3_CONFIG['bucket_name'])+1:]
-                
-                # 确定本地文件名
-                local_file = temp_dir / f"{uuid.uuid4().hex}{Path(object_key).suffix or '.jpg'}"
-                
-                # 从 S3 下载
-                self.s3_client.download_file(S3_CONFIG['bucket_name'], object_key, str(local_file))
-                local_paths.append(str(local_file.absolute()))
-            except Exception as e:
-                logger.error(f"从私有Bucket下载失败 {key}: {e}")
-        return local_paths
     
     def _upload_image(self, image_path: str, compress: bool = True) -> Optional[Dict[str, Any]]:
         """
@@ -273,14 +237,6 @@ class TouTiaoPublisher:
         driver = None
         try:
             logger.info(f"开始发布文章: {title}")
-            # --- 核心新增逻辑：处理图片下载 ---
-            if images:
-                logger.info("检测到图片标识，正在从私有 Bucket 准备文件...")
-                # 调用我们新增的下载方法（见下方第2步）
-                downloaded_local_images = self._prepare_local_images(images)
-                # 关键：将 images 变量替换为本地磁盘的绝对路径，供 Selenium 使用
-                images = downloaded_local_images 
-            # -------------------------------
             
             # 初始化浏览器
             driver = self._setup_driver()
@@ -478,7 +434,7 @@ class TouTiaoPublisher:
                         
                         # 使用用户提供的准确选择器：article-cover-add
                         upload_button = WebDriverWait(driver, 10).until(
-                            EC.element_to_be_clickable((By.CSS_SELECTOR, "byte-spin"))
+                            EC.element_to_be_clickable((By.CSS_SELECTOR, "div.article-cover-add"))
                         )
                         
                         logger.info("找到封面上传按钮，准备点击...")
@@ -1027,16 +983,6 @@ class TouTiaoPublisher:
                 'message': f'发布异常: {str(e)}'
             }
         finally:
-            # --- 核心新增逻辑：任务结束后的“清理战场” ---
-            if downloaded_local_images:
-                try:
-                    # 获取存放图片的临时文件夹路径
-                    temp_dir = Path(downloaded_local_images[0]).parent
-                    if temp_dir.exists():
-                        shutil.rmtree(temp_dir)
-                        logger.info(f"已自动清理本次任务的临时图片目录: {temp_dir}")
-                except Exception as cleanup_err:
-                    logger.warning(f"清理临时文件失败: {cleanup_err}")
             # 关闭浏览器
             if driver:
                 try:
