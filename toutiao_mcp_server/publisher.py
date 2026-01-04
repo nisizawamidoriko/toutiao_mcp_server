@@ -8,11 +8,18 @@ import json
 import time
 import logging
 import base64
+import re
 import shutil
 import os
 from typing import Dict, List, Optional, Any, Union
 from pathlib import Path
 import mimetypes
+import boto3
+from botocore.client import Config as BotoConfig  # 别名避开 config.py 冲突
+import uuid
+import shutil
+import tempfile
+from urllib.parse import urlparse
 
 import requests
 from PIL import Image
@@ -21,9 +28,10 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
-from .config import TOUTIAO_URLS, CONTENT_CONFIG, SELENIUM_CONFIG
+from .config import TOUTIAO_URLS, CONTENT_CONFIG, SELENIUM_CONFIG, S3_CONFIG
 from .auth import TouTiaoAuth
 
 logger = logging.getLogger(__name__)
@@ -40,6 +48,36 @@ class TouTiaoPublisher:
         """
         self.auth = auth
         self.session = auth.session
+        self.s3_client = boto3.client(
+            's3',
+            aws_access_key_id=S3_CONFIG['access_key'],
+            aws_secret_access_key=S3_CONFIG['secret_key'],
+            endpoint_url=S3_CONFIG['endpoint'],
+            config=BotoConfig(signature_version='s3v4') # 使用别名
+        )
+    # 新增：内部下载方法
+    def _prepare_local_images(self, image_keys: List[str]) -> List[str]:
+        local_paths = []
+        # 创建本次任务的唯一临时目录
+        temp_dir = Path(tempfile.gettempdir()) / f"tt_publish_{uuid.uuid4().hex}"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        for key in image_keys:
+            try:
+                # 即使传的是带http的URL，也尝试提取出 Key
+                object_key = urlparse(key).path.lstrip('/')
+                if object_key.startswith(S3_CONFIG['bucket_name']):
+                    object_key = object_key[len(S3_CONFIG['bucket_name'])+1:]
+                
+                # 确定本地文件名
+                local_file = temp_dir / f"{uuid.uuid4().hex}{Path(object_key).suffix or '.jpg'}"
+                
+                # 从 S3 下载
+                self.s3_client.download_file(S3_CONFIG['bucket_name'], object_key, str(local_file))
+                local_paths.append(str(local_file.absolute()))
+            except Exception as e:
+                logger.error(f"从私有Bucket下载失败 {key}: {e}")
+        return local_paths
     
     def _upload_image(self, image_path: str, compress: bool = True) -> Optional[Dict[str, Any]]:
         """
@@ -149,6 +187,80 @@ class TouTiaoPublisher:
         except Exception as e:
             logger.warning(f"图片压缩失败: {e}，使用原图片")
             return image_path
+
+    def _insert_mixed_content(self, driver, wait, content, images):
+        """
+        处理图文混排：将文字分段，遇到 [IMAGE_N] 占位符时执行插图
+        """
+        # 1. 找到正文编辑器并点击聚焦
+        # 头条编辑器通常在 syl-editor-layer 或 ProseMirror 类下
+        try:
+            editor = wait.until(EC.presence_of_element_located((By.CLASS_NAME, "ProseMirror")))
+            editor.click()
+            time.sleep(1)
+            
+            # 2. 使用正则表达式切分内容
+            # 比如： "第一段[IMAGE_1]第二段" -> ["第一段", "[IMAGE_1]", "第二段"]
+            parts = re.split(r'(\[IMAGE_\d+\])', content)
+            img_idx = 0
+            
+            for part in parts:
+                part = part.strip()
+                if not part: continue
+                
+                # 检查是否为占位符
+                if re.match(r'\[IMAGE_\d+\]', part):
+                    if images and img_idx < len(images):
+                        logger.info(f"触发占位符插入，正在上传第 {img_idx + 1} 张图...")
+                        self._upload_image_to_body(driver, wait, images[img_idx])
+                        img_idx += 1
+                        time.sleep(1)
+                else:
+                    # 普通文字段落
+                    logger.info(f"正在输入段落文字: {part[:20]}...")
+                    # 使用 execute_script 插入文字更稳定，或者直接 send_keys
+                    editor.send_keys(part)
+                    editor.send_keys(Keys.ENTER) # 模拟换行
+                    time.sleep(0.5)
+                    
+        except Exception as e:
+            logger.error(f"正文图文混排插入失败: {e}")
+
+    def _upload_image_to_body(self, driver, wait, img_path):
+        """
+        点击工具栏图片按钮并完成上传
+        """
+        try:
+            # 1. 点击工具栏上的“添加图片”按钮
+            # 使用你截图中的类名定位
+            toolbar_img_btn = wait.until(EC.element_to_be_clickable(
+                (By.CSS_SELECTOR, "div.syl-toolbar-tool.image.static")
+            ))
+            toolbar_img_btn.click()
+            time.sleep(1)
+
+            # 2. 点击弹窗中的“上传本地图片” (复用封面逻辑)
+            upload_local_btn = wait.until(EC.element_to_be_clickable(
+                (By.CSS_SELECTOR, "div.btn-upload-handle.upload-handler")
+            ))
+            driver.execute_script("arguments[0].click();", upload_local_btn)
+
+            # 3. 发送路径并点击确认 (复用封面逻辑)
+            file_input = wait.until(EC.presence_of_element_located(
+                (By.CSS_SELECTOR, ".btn-upload-handle.upload-handler input[type='file']")
+            ))
+            abs_path = os.path.abspath(img_path)
+            file_input.send_keys(abs_path)
+            
+            confirm_btn = wait.until(EC.element_to_be_clickable(
+                (By.CSS_SELECTOR, "button[data-e2e='imageUploadConfirm-btn']")
+            ))
+            driver.execute_script("arguments[0].click();", confirm_btn)
+            
+            # 等待图片插入完成
+            time.sleep(2)
+        except Exception as e:
+            logger.error(f"正文单张图片插入步骤失败: {e}")
     
     def _setup_driver(self) -> webdriver.Chrome:
         """设置Chrome浏览器驱动"""
@@ -237,9 +349,18 @@ class TouTiaoPublisher:
         driver = None
         try:
             logger.info(f"开始发布文章: {title}")
+            # --- 核心新增逻辑：处理图片下载 ---
+            if images:
+                logger.info("检测到图片标识，正在从私有 Bucket 准备文件...")
+                # 调用我们新增的下载方法（见下方第2步）
+                downloaded_local_images = self._prepare_local_images(images)
+                # 关键：将 images 变量替换为本地磁盘的绝对路径，供 Selenium 使用
+                images = downloaded_local_images 
+            # -------------------------------
             
             # 初始化浏览器
             driver = self._setup_driver()
+            wait = WebDriverWait(driver, 20)
             
             # 传递登录Cookie
             self._transfer_cookies_to_driver(driver)
@@ -368,48 +489,11 @@ class TouTiaoPublisher:
                 except Exception as e:
                     logger.info(f"未检测到占位符或清除失败: {e}")
                 
-                # 使用JavaScript插入内容（避免输入法问题）
-                logger.info("使用JavaScript设置正文内容...")
+                # 【核心更改】：调用混排插入方法
+                # 不再使用 innerHTML，而是模拟人工分段输入和插图
+                self._insert_mixed_content(driver, wait, content, downloaded_local_images)
                 
-                # 处理内容，转换为HTML格式
-                safe_content = content.replace('\\', '\\\\').replace('`', '\\`').replace('$', '\\$')
-                # 将换行符转换为段落标签，保持更好的格式
-                paragraphs = safe_content.split('\n')
-                formatted_content = ''
-                for para in paragraphs:
-                    para = para.strip()
-                    if para:
-                        formatted_content += f'<p>{para}</p>'
-                    else:
-                        formatted_content += '<p><br></p>'
-                
-                # 多步骤设置内容，确保稳定性
-                logger.info("第1步：清空编辑器内容...")
-                driver.execute_script("arguments[0].innerHTML = '';", content_editor)
-                time.sleep(1)
-                
-                logger.info("第2步：设置新内容...")
-                driver.execute_script("arguments[0].innerHTML = arguments[1];", content_editor, formatted_content)
-                time.sleep(2)
-                
-                logger.info("第3步：触发内容变更事件...")
-                # 触发必要的事件，确保编辑器识别内容变化
-                driver.execute_script("""
-                    var event = new Event('input', { bubbles: true });
-                    arguments[0].dispatchEvent(event);
-                    var changeEvent = new Event('change', { bubbles: true });
-                    arguments[0].dispatchEvent(changeEvent);
-                """, content_editor)
-                
-                logger.info("第4步：点击编辑器确保焦点...")
-                try:
-                    driver.execute_script("arguments[0].click();", content_editor)
-                    time.sleep(1)
-                except:
-                    pass
-                
-                logger.info("正文内容输入完成")
-                time.sleep(1.5)  # 设置停顿时间，让编辑器稳定
+                logger.info("正文及图片插入流程执行完毕")
                 
             except Exception as e:
                 logger.error(f"输入正文内容失败: {e}")
@@ -417,212 +501,33 @@ class TouTiaoPublisher:
                     'success': False,
                     'message': f'输入正文内容失败: {str(e)}'
                 }
-            
-            # 3. 上传封面图片 - 使用用户提供的准确元素选择器
-            if images and len(images) > 0:
+            # 3. 勾选作品声明：个人观点，仅供参考
+            try:
+                logger.info("尝试勾选作品声明：个人观点，仅供参考...")
+                
+                # 使用包含逗号的准确文本进行 XPATH 定位
+                # 定位到包含指定文字的 label 标签
+                target_xpath = "//label[contains(., '个人观点') and contains(., '仅供参考')]"
+                
+                # 1. 先等待元素加载
+                declaration_label = wait.until(EC.presence_of_element_located((By.XPATH, target_xpath)))
+                
+                # 2. 滚动到该元素位置（确保元素在可视区域内，避免被遮挡）
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", declaration_label)
+                time.sleep(1) # 等待滚动稳定
+                
+                # 3. 点击 label 元素
+                # 这种 byte-checkbox 结构，点击 label 或点击内部的 mask 层通常最有效
                 try:
-                    logger.info("正在上传封面图片...")
-                    
-                    # 只上传第一张图片作为封面
-                    img_path = images[0]
-                    
-                    try:
-                        logger.info("寻找封面图片上传按钮...")
-                        
-                        # 等待页面稳定
-                        time.sleep(2)
-                        
-                        # 使用用户提供的准确选择器：article-cover-add
-                        upload_button = WebDriverWait(driver, 10).until(
-                            EC.element_to_be_clickable((By.CSS_SELECTOR, "div.article-cover-add"))
-                        )
-                        
-                        logger.info("找到封面上传按钮，准备点击...")
-                        
-                        # 滚动到可见区域
-                        driver.execute_script("arguments[0].scrollIntoView(true);", upload_button)
-                        time.sleep(1)
-                        
-                        # 使用JavaScript点击上传按钮
-                        driver.execute_script("arguments[0].click();", upload_button)
-                        logger.info("已点击封面上传按钮")
-                        
-                        # 第二步：点击"上传本地图片"按钮
-                        logger.info("寻找并点击'上传本地图片'按钮...")
-                        upload_local_button = WebDriverWait(driver, 10).until(
-                            EC.element_to_be_clickable((By.CSS_SELECTOR, "div.btn-upload-handle.upload-handler"))
-                        )
-                        
-                        logger.info("找到'上传本地图片'按钮，准备点击...")
-                        
-                        # 滚动到按钮可见区域
-                        driver.execute_script("arguments[0].scrollIntoView(true);", upload_local_button)
-                        time.sleep(1)
-                        
-                        # 使用JavaScript点击"上传本地图片"按钮
-                        driver.execute_script("arguments[0].click();", upload_local_button)
-                        logger.info("已点击'上传本地图片'按钮")
-                        
-                        # 第三步：使用文件输入框选择图片
-                        logger.info("寻找文件输入框...")
-                        file_input = WebDriverWait(driver, 10).until(
-                            EC.presence_of_element_located((By.CSS_SELECTOR, ".btn-upload-handle.upload-handler input[type='file']"))
-                        )
-                        
-                        logger.info("找到文件输入框，准备上传图片...")
-                        
-                        # 准备图片路径
-                        abs_img_path = os.path.abspath(img_path) if not os.path.isabs(img_path) else img_path
-                        
-                        # 检查文件是否存在
-                        if not os.path.exists(abs_img_path):
-                            logger.error(f"图片文件不存在: {abs_img_path}")
-                            raise Exception(f"图片文件不存在: {abs_img_path}")
-                        
-                        logger.info(f"上传封面图片: {abs_img_path}")
-                        
-                        # 上传图片文件
-                        file_input.send_keys(abs_img_path)
-                        
-                        # 等待图片上传和处理...
-                        logger.info("Waiting for image upload confirm button to be clickable after send_keys...")
-                        WebDriverWait(driver, 30).until(
-                            EC.element_to_be_clickable((By.CSS_SELECTOR, "button[data-e2e='imageUploadConfirm-btn']"))
-                        )
-                        logger.info("Image upload confirm button is now clickable.")
-                        
-                        # 查找并点击确认按钮 - 使用用户提供的准确选择器
-                        logger.info("寻找图片上传确认按钮...")
-                        try:
-                            # 使用 data-e2e 属性精确定位确认按钮
-                            confirm_button = WebDriverWait(driver, 10).until(
-                                EC.element_to_be_clickable((By.CSS_SELECTOR, "button[data-e2e='imageUploadConfirm-btn']"))
-                            )
-                            
-                            logger.info("找到图片上传确认按钮，准备点击...")
-                            
-                            # 滚动到按钮可见区域
-                            driver.execute_script("arguments[0].scrollIntoView(true);", confirm_button)
-                            time.sleep(1)
-                            
-                            # 使用JavaScript点击确认按钮
-                            driver.execute_script("arguments[0].click();", confirm_button)
-                            logger.info("已点击图片上传确认按钮")
-                            
-                            # 等待确认完成
-                            time.sleep(1.5)
-                            
-                            logger.info(f"封面图片上传并确认完成: {img_path}")
-                            
-                        except Exception as confirm_err:
-                            logger.error(f"点击确认按钮失败: {confirm_err}")
-                            logger.info("尝试其他确认按钮定位方式...")
-                            
-                            # 备用确认按钮定位方式
-                            try:
-                                confirm_selectors = [
-                                    "button.byte-btn-primary span:contains('确定')",
-                                    "button[class*='btn-primary'] span[text()='确定']",
-                                    ".byte-btn-primary:contains('确定')"
-                                ]
-                                
-                                for selector in confirm_selectors:
-                                    try:
-                                        if "contains" in selector:
-                                            # 使用XPath处理包含文本的选择器
-                                            xpath = f"//button[contains(@class, 'btn-primary')]//span[text()='确定']"
-                                            confirm_btn = driver.find_element(By.XPATH, xpath)
-                                        else:
-                                            confirm_btn = driver.find_element(By.CSS_SELECTOR, selector)
-                                        
-                                        if confirm_btn.is_displayed():
-                                            driver.execute_script("arguments[0].click();", confirm_btn)
-                                            logger.info("使用备用方式点击确认按钮成功")
-                                            time.sleep(3)
-                                            break
-                                    except:
-                                        continue
-                                
-                            except Exception as backup_err:
-                                logger.warning(f"备用确认按钮点击也失败: {backup_err}")
-                                logger.warning("图片可能已自动确认，继续执行...")
-                        
-                        logger.info(f"封面图片处理完成: {img_path}")
-                        
-                    except Exception as upload_err:
-                        logger.error(f"封面图片上传失败: {upload_err}")
-                        logger.info("尝试备用上传方法...")
-                        
-                        # 备用方法：尝试完整的两步点击流程
-                        try:
-                            logger.info("使用备用方法：尝试完整两步点击流程...")
-                            
-                            # 备用第一步：再次尝试点击封面上传区域
-                            try:
-                                cover_areas = driver.find_elements(By.CSS_SELECTOR, "div.article-cover-add")
-                                if cover_areas:
-                                    for area in cover_areas:
-                                        if area.is_displayed():
-                                            driver.execute_script("arguments[0].click();", area)
-                                            logger.info("备用方法：已点击封面上传区域")
-                                            time.sleep(3)
-                                            break
-                            except Exception as e:
-                                logger.debug(f"备用方法点击封面区域失败: {e}")
-                            
-                            # 备用第二步：尝试点击上传本地图片按钮
-                            try:
-                                upload_buttons = driver.find_elements(By.CSS_SELECTOR, "div.btn-upload-handle.upload-handler")
-                                if upload_buttons:
-                                    for btn in upload_buttons:
-                                        if btn.is_displayed():
-                                            driver.execute_script("arguments[0].click();", btn)
-                                            logger.info("备用方法：已点击上传本地图片按钮")
-                                            time.sleep(2)
-                                            break
-                            except Exception as e:
-                                logger.debug(f"备用方法点击上传按钮失败: {e}")
-                            
-                            # 备用第三步：使用文件输入框
-                            file_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='file'][accept*='image']")
-                            if file_inputs:
-                                for file_input in file_inputs:
-                                    try:
-                                        abs_img_path = os.path.abspath(img_path) if not os.path.isabs(img_path) else img_path
-                                        logger.info(f"备用方法上传图片: {abs_img_path}")
-                                        file_input.send_keys(abs_img_path)
-                                        
-                                        # 等待上传完成
-                                        time.sleep(5)
-                                        
-                                        # 尝试点击确认按钮
-                                        try:
-                                            confirm_button = WebDriverWait(driver, 5).until(
-                                                EC.element_to_be_clickable((By.CSS_SELECTOR, "button[data-e2e='imageUploadConfirm-btn']"))
-                                            )
-                                            driver.execute_script("arguments[0].click();", confirm_button)
-                                            logger.info("备用方法：已点击确认按钮")
-                                            time.sleep(3)
-                                        except:
-                                            logger.info("备用方法：未找到确认按钮，可能已自动确认")
-                                        
-                                        logger.info("备用方法上传完成")
-                                        break
-                                    except Exception as input_err:
-                                        logger.debug(f"备用方法使用文件输入框失败: {input_err}")
-                                        continue
-                            else:
-                                logger.warning("备用方法：找不到任何可用的文件输入框")
-                                
-                        except Exception as backup_err:
-                            logger.error(f"备用上传方法也失败: {backup_err}")
-                    
-                    logger.info("封面图片处理完成")
-                    
-                except Exception as e:
-                    logger.warning(f"封面图片上传处理失败: {e}")
-                    # 继续执行，图片不是必须的
-            
+                    declaration_label.click()
+                except:
+                    # 如果普通点击失败，尝试 JS 强制点击
+                    driver.execute_script("arguments[0].click();", declaration_label)
+                
+                logger.info("已完成勾选动作：个人观点，仅供参考")
+                time.sleep(1) 
+            except Exception as e:
+                logger.warning(f"勾选作品声明失败: {e}")
             # 4. 添加标签（如果有）
             if tags and len(tags) > 0:
                 try:
@@ -983,6 +888,16 @@ class TouTiaoPublisher:
                 'message': f'发布异常: {str(e)}'
             }
         finally:
+            # --- 核心新增逻辑：任务结束后的“清理战场” ---
+            if downloaded_local_images:
+                try:
+                    # 获取存放图片的临时文件夹路径
+                    temp_dir = Path(downloaded_local_images[0]).parent
+                    if temp_dir.exists():
+                        shutil.rmtree(temp_dir)
+                        logger.info(f"已自动清理本次任务的临时图片目录: {temp_dir}")
+                except Exception as cleanup_err:
+                    logger.warning(f"清理临时文件失败: {cleanup_err}")
             # 关闭浏览器
             if driver:
                 try:
